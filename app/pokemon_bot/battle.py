@@ -555,7 +555,7 @@ def _copy_mon(mon):
 def _simulate(board0, reserves0, field0, actions0, actions1, tie=0, details=False):
     board = [_copy_mon(m) for m in board0]
     reserves = [dict(side) for side in reserves0]
-    state = {"weather": field0["weather"], "fields": set(field0["fields"]), "conditions": [set(x) for x in field0["conditions"]]}
+    state = {"weather": field0["weather"], "fields": set(field0["fields"]), "conditions": [set(x) for x in field0["conditions"]], "turn": field0.get("turn", 1)}
     actions = [actions0.get(f"slot_{i}", {"type": "pass"}) for i in range(2)] + [actions1.get(f"slot_{i}", {"type": "pass"}) for i in range(2)]
     advances_turn = not field0.get("forced_switch", not any(action["type"] == "move" for action in actions))
     utility, changes = [0.0, 0.0], [0.0] * 4
@@ -728,6 +728,13 @@ def _simulate(board0, reserves0, field0, actions0, actions1, tie=0, details=Fals
             dealt = min(target.hp, damage)
             landed = True
             target.hp = max(0, target.hp - damage)
+            # Reward early removal of a foe that still had a usable attack/action.
+            # The same rule applies to the opponent; trading our attacker is costly.
+            if (target.hp <= 0 and hostile and j in pending and j not in flinch
+                    and actions[j]["type"] == "move"
+                    and _usable(target, _action_move(target, actions[j]))
+                    and state["turn"] <= 4):
+                utility[mon.side] += .18
             if target.hp > 0 and target.ability == "stamina":
                 changes[j] += _boost(target, {"def": min(6, int(_num(move.get("multihit"), 3 if ident == "surgingstrikes" else 1)))})
             if target.item == "sitrusberry" and 0 < target.hp <= .5:
@@ -792,7 +799,7 @@ def _simulate(board0, reserves0, field0, actions0, actions1, tie=0, details=Fals
                 utility[mon.side] += min(.25, substitute[i]) * .8
         utility[mon.side] += (mon.hp - original_hp[i]) * .92
         if mon.hp <= 0 and original_hp[i] > 0:
-            utility[mon.side] -= .77
+            utility[mon.side] -= .95
         if advances_turn:
             mon.first_turn = actions[i]["type"] == "switch"
             mon.protect_streak = mon.protect_streak + 1 if norm(actions[i].get("move_id", "")) in PROTECT else 0
@@ -802,6 +809,7 @@ def _simulate(board0, reserves0, field0, actions0, actions1, tie=0, details=Fals
             foes = [m for m in board[(1-side)*2:(1-side)*2+2] if m and m.hp > 0]
             pressure = sum(max((_damage(board[i], foe, move, state, board) for move in board[i].moves if move["category"] != "status" for foe in foes), default=0) for i in guarded)
             utility[side] -= min(.35, .3 * pressure)
+    state["turn"] += int(advances_turn)
     value = utility[0] - utility[1]
     return (value, board, state, reserves) if details else value
 
@@ -861,7 +869,7 @@ def _next_actions(board, state, side):
 def _continuation(board0, reserves0, state0):
     board = [_copy_mon(mon) for mon in board0]
     reserves = [dict(side) for side in reserves0]
-    state = {"weather": state0["weather"], "fields": set(state0["fields"]), "conditions": [set(x) - {"wideguard", "quickguard"} for x in state0["conditions"]]}
+    state = {"weather": state0["weather"], "fields": set(state0["fields"]), "conditions": [set(x) - {"wideguard", "quickguard"} for x in state0["conditions"]], "turn": state0.get("turn", 1)}
     replacements = []
     for side in range(2):
         active_species = {mon.species for mon in board[side*2:side*2+2] if mon and mon.hp > 0}
@@ -970,7 +978,7 @@ def _quick(board, reserves, state, joint, side):
     for target_index, damage in hit_targets.items():
         hp = board[target_index].hp
         if damage >= hp:
-            total += .72
+            total += .90
         else:
             total += damage / max(.05, hp) * .05
     return total
@@ -1051,7 +1059,7 @@ def choose_battle(observation: dict, template: dict, memory: dict) -> dict:
                 ident = norm(action.get("species", ""))
                 if ident and ident not in reserves[0]:
                     reserves[0][ident] = _make_mon({"species": action["species"]}, 0, slot, memory, turn, {})
-    state = {"weather": _weather(observation), "fields": _names(observation.get("fields")), "conditions": [_names(observation.get("side_conditions")), _names(observation.get("opponent_side_conditions"))]}
+    state = {"weather": _weather(observation), "fields": _names(observation.get("fields")), "conditions": [_names(observation.get("side_conditions")), _names(observation.get("opponent_side_conditions"))], "turn": turn}
     if any(m and m.hp > 0 and m.ability in {"cloudnine", "airlock"} for m in board):
         state["weather"] = ""
     forced = observation.get("force_switch", [False, False])

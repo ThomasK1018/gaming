@@ -211,7 +211,13 @@ def _profile(raw: dict, key: str) -> _Mon:
     special = max((move.power * move.accuracy * stats["spa"] / 160 for move in damaging if move.category == "special"), default=0)
     offense = max(physical, special)
     bulk = sqrt(stats["hp"] * sqrt(stats["def"] * stats["spd"]))
-    quality = 0.030 * offense + 0.026 * bulk + 0.012 * speed + _PRIOR.get(species, 0)
+    # Early-tempo profile: modestly favor immediate offense and speed.
+    quality = 0.036 * offense + 0.026 * bulk + 0.014 * speed + _PRIOR.get(species, 0)
+    if "priority" in roles:
+        quality += 0.45
+    # Owning a setup move is not itself a drawback: penalize weak immediate output.
+    if "setup" in roles and offense <= 70:
+        quality -= 0.60
     quality += _ABILITY_VALUE.get(ability, 0)
     quality += min(3.8, sum(_STATUS_VALUE.get(move.name, 0) for move in moves))
     quality += 0.65 * sum(move.spread for move in damaging)
@@ -407,7 +413,7 @@ class _Evaluation:
                 value -= 1.1 * slow
             offense = sum(max(mon.physical, mon.special) > 70 for mon in members)
             if offense < min(n - 1, 3):
-                value -= 2.0 * (min(n - 1, 3) - offense)
+                value -= 3.0 * (min(n - 1, 3) - offense)
             if all(mon.physical > mon.special for mon in members):
                 value -= 2.0
             if all(mon.special >= mon.physical for mon in members):
@@ -442,6 +448,10 @@ class _Evaluation:
         if len(own) < 2 or len(enemies) < 2:
             return 0.0
         value = self.synergy(*own) * 0.7
+        # Discourage double low-output leads, symmetrically for both teams.
+        for side, sign in ((own, 1), (enemies, -1)):
+            if all(max(mon.physical, mon.special) <= 70 for mon in side):
+                value -= sign * 1.0
         own_control = any("tailwind" in mon.roles for mon in own)
         opp_control = any("tailwind" in mon.roles for mon in enemies)
         own_slow = sum(mon.speed < 95 for mon in own)
