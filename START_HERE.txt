@@ -1,0 +1,38 @@
+AltruAgent Pokemon Bot — macOS source package
+
+1. Extract the entire ZIP into a writable folder, such as Documents.
+2. Install Python 3.11 or newer for macOS if needed.
+3. Open Setup.command once. It creates a local .venv, installs dependencies
+   using the supplied pyproject.toml, and runs the offline self-test.
+   Internet access is required for dependency installation.
+4. Open StartBot.command. Select your mode and enter your Official Agent Key
+   at the hidden prompt. Keep Terminal open while playing.
+5. CheckMac.command repeats the offline self-test without authenticating.
+
+If Finder will not open a script, open Terminal, type bash followed by a
+space, drag the .command file into Terminal, and press Return.
+If setup chooses an older Python, use in Terminal:
+  POKEMON_PYTHON=/absolute/path/to/python3 bash /path/to/Setup.command
+
+Keep the app folder and scripts together. If you move the extracted folder
+or transfer it to another Mac, rerun Setup.command to rebuild its environment.
+Compatible in design with Intel and Apple silicon, using the Python installed
+on that Mac. This is a Python source launcher package, not a standalone .app.
+The Windows interpreter and Windows binary dependencies are not included.
+
+Use only one bot process per account. Logs are written to app/logs.
+No account was authenticated and no matches were started during preparation.
+The supplied source was preserved; the bot strategy was not modified.
+The source in the nested Windows ZIP may differ from the separate EXE.
+The original Chinese guide and app validation reports describe the supplied
+bot; their reported results are not new macOS validation results.
+
+Validation of this adaptation: Python syntax and shell syntax checked here.
+Native macOS execution has not been tested. Run CheckMac.command on your Mac.
+Dependencies use the original project's version constraints, not a frozen lock.
+
+中文快速开始：
+解压整个文件夹，安装 macOS Python 3.11 或更新版本。
+先打开 Setup.command 安装依赖并离线自检，再打开 StartBot.command。
+CheckMac.command 可重复离线自检。需要保持终端开启。
+此包为 Mac Python 启动版，不是内置 Python 的独立 .app。
