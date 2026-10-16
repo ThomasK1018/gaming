@@ -44,6 +44,8 @@ _STATUS_VALUE = {
     "nuzzle": 0.8, "snarl": 0.6, "screens": 0.5, "auroraveil": 1.1,
 }
 _WEATHER_ABILITIES = {"drizzle": "rain", "drought": "sun", "orichalcumpulse": "sun", "sandstream": "sand", "snowwarning": "snow"}
+_PRIORITY_GUARDS = {"armortail", "queenlymajesty", "dazzling"}
+_TERRAIN_ABILITIES = {"grassysurge": "grass", "psychicsurge": "psychic", "electricsurge": "electric", "hadronengine": "electric", "mistysurge": "misty"}
 _CHART_CACHE: dict[tuple[str, tuple[str, ...]], float] = {}
 
 
@@ -210,6 +212,22 @@ def _profile(raw: dict, key: str) -> _Mon:
     physical = max((move.power * move.accuracy * stats["atk"] / 160 for move in damaging if move.category == "physical"), default=0)
     special = max((move.power * move.accuracy * stats["spa"] / 160 for move in damaging if move.category == "special"), default=0)
     offense = max(physical, special)
+    # Draft-only role estimates: reward the offered set, not a species name.
+    # The battle evaluator still checks the actual terrain and grounding.
+    self_grass = ability == "grassysurge" and "flying" not in types and item != "airballoon"
+    if self_grass and any(move.name == "grassyglide" for move in damaging):
+        roles.add("priority")
+    reliable_stab = [move for move in damaging if move.kind in types and move.power >= 70 and move.accuracy >= 0.9]
+    passive_pressure = (
+        ability in {"adaptability", "goodasgold"}
+        or ability == "unseenfist" and any(move.name in {"surgingstrikes", "wickedblow", "closecombat"} for move in reliable_stab)
+        or self_grass and any(move.kind == "grass" for move in reliable_stab)
+        or ability == "beadsofruin" and any(move.category == "special" for move in reliable_stab)
+        or ability == "swordofruin" and any(move.category == "physical" for move in reliable_stab)
+        or item == "boosterenergy" and ability in {"protosynthesis", "quarkdrive"}
+    )
+    if names and offense > 70 and reliable_stab and (passive_pressure or speed >= 135):
+        roles.add("independent")
     bulk = sqrt(stats["hp"] * sqrt(stats["def"] * stats["spd"]))
     # Early-tempo profile: modestly favor immediate offense and speed.
     quality = 0.036 * offense + 0.026 * bulk + 0.014 * speed + _PRIOR.get(species, 0)
@@ -249,20 +267,50 @@ def _profile(raw: dict, key: str) -> _Mon:
     return _Mon(key, species, types, stats, ability, item, tuple(moves), frozenset(roles), quality, physical, special, speed, weather)
 
 
+def _grounded(mon: _Mon) -> bool:
+    return mon.item == "ironball" or ("flying" not in mon.types and mon.ability != "levitate" and mon.item != "airballoon")
+
+
+def _entry_terrains(mons: list[_Mon]) -> tuple[str, ...]:
+    # Opening abilities resolve fastest first; the slowest setter wins.
+    # Average tied setters rather than promising either terrain will remain.
+    setters = [mon for mon in mons if mon.ability in _TERRAIN_ABILITIES]
+    if not setters:
+        return ("",)
+    slowest = min(mon.speed for mon in setters)
+    return tuple(_TERRAIN_ABILITIES[mon.ability] for mon in setters if mon.speed == slowest)
+
+
+def _priority_protected(defender: _Mon, guarded: bool, terrain: str) -> bool:
+    return guarded or defender.ability in _PRIORITY_GUARDS or terrain == "psychic" and _grounded(defender)
+
+
+def _fakeout_targets(targets: list[_Mon], terrain: str) -> list[_Mon]:
+    guarded = any(mon.ability in _PRIORITY_GUARDS for mon in targets)
+    return [mon for mon in targets if not _priority_protected(mon, guarded, terrain)
+            and "ghost" not in mon.types and mon.ability not in {"innerfocus", "shielddust"} and mon.item != "covertcloak"]
+
+
 class _Evaluation:
     def __init__(self, mons: list[_Mon]):
         self.mons = {mon.key: mon for mon in mons}
-        self.damage_cache: dict[tuple[str, str], float] = {}
+        self.damage_cache: dict[tuple[str, str, str, bool, float | None], float] = {}
         self.team_cache: dict[tuple[tuple[str, ...], tuple[str, ...]], float] = {}
         self.pair_cache: dict[tuple[str, str], float] = {}
 
-    def damage(self, attacker: _Mon, defender: _Mon) -> float:
-        key = (attacker.key, defender.key)
+    def damage(self, attacker: _Mon, defender: _Mon, *, terrain: str | None = None, guarded: bool = False, outspeed: float | None = None) -> float:
+        if terrain is None:
+            terrains = _entry_terrains([attacker, defender])
+            return sum(self.damage(attacker, defender, terrain=entry, guarded=guarded, outspeed=outspeed) for entry in terrains) / len(terrains)
+        key = (attacker.key, defender.key, terrain, guarded, outspeed)
         if key in self.damage_cache:
             return self.damage_cache[key]
         best = 0.0
         for move in attacker.moves:
             if move.power <= 0 or move.category == "status":
+                continue
+            priority = move.priority + (1 if move.name == "grassyglide" and terrain == "grass" and _grounded(attacker) else 0)
+            if priority > 0 and _priority_protected(defender, guarded, terrain):
                 continue
             effectiveness = _effect(move.kind, defender.types)
             if defender.ability in {"levitate", "eartheater"} and move.kind == "ground":
@@ -311,8 +359,12 @@ class _Evaluation:
                 modifier *= 0.75
             fraction = (22 * move.power * atk / defense / 50 + 2) * stab * effectiveness * modifier * 0.925 / defender.stats["hp"]
             fraction *= move.accuracy
-            if move.priority > 0 and "antipriority" not in defender.roles:
+            if priority > 0:
                 fraction *= 1.08
+            if outspeed is not None:
+                # A weak priority move must not lend its speed to a stronger
+                # ordinary attack. Score each usable move before taking max.
+                fraction *= 0.72 + 0.28 * (max(outspeed, 0.85) if priority > 0 else outspeed)
             if move.name == "fakeout":
                 fraction *= 0.4
             best = max(best, fraction)
@@ -401,6 +453,9 @@ class _Evaluation:
         n = len(members)
         quality = sorted((mon.quality for mon in members), reverse=True)
         value = sum(quality[:4]) + 0.25 * sum(quality[4:])
+        # A small preference for up to three attackers that need no setup
+        # turn or partner activation. Matchups and item legality still decide.
+        value += 0.8 * min(3, sum("independent" in mon.roles for mon in members))
         synergies = [self.synergy(a, b) for a, b in combinations(members, 2)]
         value += sum(synergies) * (0.75 if n <= 4 else 0.45)
         roles = set().union(*(mon.roles for mon in members))
@@ -443,13 +498,22 @@ class _Evaluation:
         return value
 
     def lead(self, pair: tuple[str, str], opposition: tuple[str, str]) -> float:
+        terrains = _entry_terrains([self.mons[x] for x in pair + opposition])
+        return sum(self._lead_in_terrain(pair, opposition, terrain) for terrain in terrains) / len(terrains)
+
+    def _lead_in_terrain(self, pair: tuple[str, str], opposition: tuple[str, str], terrain: str) -> float:
         own = [self.mons[x] for x in pair]
         enemies = [self.mons[x] for x in opposition]
         if len(own) < 2 or len(enemies) < 2:
             return 0.0
         value = self.synergy(*own) * 0.7
+        if not _fakeout_targets(enemies, terrain):
+            for setter, partner in ((own[0], own[1]), (own[1], own[0])):
+                if "fakeout" in setter.roles and partner.roles & {"tailwind", "trickroom", "setup", "spore"}:
+                    value -= 0.7 * 1.15
         # Discourage double low-output leads, symmetrically for both teams.
         for side, sign in ((own, 1), (enemies, -1)):
+            value += sign * 0.35 * sum("independent" in mon.roles for mon in side)
             if all(max(mon.physical, mon.special) <= 70 for mon in side):
                 value -= sign * 1.0
         own_control = any("tailwind" in mon.roles for mon in own)
@@ -460,19 +524,18 @@ class _Evaluation:
         opp_tr = any("trickroom" in mon.roles for mon in enemies)
         for side, targets, sign, controlled, counter_control in ((own, enemies, 1, own_control, opp_control), (enemies, own, -1, opp_control, own_control)):
             results = []
+            guarded = any(mon.ability in _PRIORITY_GUARDS for mon in targets)
             for mon in side:
                 damage = []
                 for enemy in targets:
                     speed = mon.speed * (1.50 if controlled and not counter_control else 1)
                     enemy_speed = enemy.speed * (1.50 if counter_control and not controlled else 1)
                     outspeed = 1.0 if speed > enemy_speed else 0.7 if speed == enemy_speed else 0.45
-                    if "priority" in mon.roles and "antipriority" not in enemy.roles:
-                        outspeed = max(outspeed, 0.85)
-                    damage.append(self.damage(mon, enemy) * (0.72 + 0.28 * outspeed))
+                    damage.append(self.damage(mon, enemy, terrain=terrain, guarded=guarded, outspeed=outspeed))
                 results.append(damage)
                 if "fakeout" in mon.roles:
-                    vulnerable = [enemy for enemy in targets if "ghost" not in enemy.types and enemy.ability not in {"innerfocus", "shielddust"} and enemy.item != "covertcloak"]
-                    if vulnerable and not any("antipriority" in enemy.roles for enemy in targets):
+                    vulnerable = _fakeout_targets(targets, terrain)
+                    if vulnerable:
                         value += sign * (0.75 + 0.5 * any(enemy.roles & {"trickroom", "tailwind", "spore", "setup"} for enemy in vulnerable))
                 if "intimidate" in mon.roles:
                     value += sign * 0.4 * sum(enemy.physical > enemy.special and enemy.ability not in {"defiant", "competitive", "clearbody", "innerfocus", "fullmetalbody"} and enemy.item != "clearamulet" for enemy in targets)
@@ -488,9 +551,9 @@ class _Evaluation:
             focus = max(min(1.7, results[0][j] + results[1][j]) + (0.45 if results[0][j] + results[1][j] >= 1 else 0) for j in range(2))
             value += sign * 2.8 * max(split, focus)
         if own_tr and own_slow > opp_slow:
-            value += 1.0 + 0.5 * any(mon.roles & {"fakeout", "redirect"} for mon in own)
+            value += 1.0 + 0.5 * any("redirect" in mon.roles or "fakeout" in mon.roles and _fakeout_targets(enemies, terrain) for mon in own)
         if opp_tr and opp_slow > own_slow:
-            value -= 1.0 + 0.5 * any(mon.roles & {"fakeout", "redirect"} for mon in enemies)
+            value -= 1.0 + 0.5 * any("redirect" in mon.roles or "fakeout" in mon.roles and _fakeout_targets(own, terrain) for mon in enemies)
         if own_control and not opp_control:
             value += 0.7
         if opp_control and not own_control:

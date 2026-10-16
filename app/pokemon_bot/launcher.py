@@ -32,6 +32,7 @@ def main():
     os.chdir(root)
     from dotenv import load_dotenv
     load_dotenv(root / '.env')
+    os.environ.setdefault('ALTRUAGENT_CONTROL_URL', 'https://api.altruagent-game.com')
     os.environ.setdefault('POKEMON_LOG_DIR', str(root / 'logs'))
     print('AltruAgent Pokemon VGC Bot 1.0')
     print('1  Test matches\n2  Tournament matches\n3  Both\n4  Check connection\n5  Offline self-test')
