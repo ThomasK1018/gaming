@@ -11,6 +11,8 @@ from .legal import enumerate_actions
 
 PROTECT = {"protect", "detect", "spikyshield", "banefulbunker", "silktrap", "burningbulwark", "kingsshield", "obstruct"}
 HEAL = {"recover", "roost", "slackoff", "softboiled", "milkdrink", "shoreup", "synthesis", "morningsun", "moonlight", "rest"}
+TEAM_BUFFS = {"tailwind", "reflect", "lightscreen", "auroraveil", "safeguard"}
+ALLY_SUPPORT = {"pollenpuff", "healpulse", "floralhealing", "helpinghand"}
 STAT_ALIASES = {"attack": "atk", "defense": "def", "specialattack": "spa", "specialdefense": "spd", "speed": "spe", "accuracy": "accuracy", "evasion": "evasion"}
 IMMUNITIES = {
     "electric": {"voltabsorb", "lightningrod", "motordrive"},
@@ -552,6 +554,44 @@ def _copy_mon(mon):
     return replace(mon, boosts=dict(mon.boosts), effects=set(mon.effects), moves=[dict(move) for move in mon.moves]) if mon else None
 
 
+def _tailwind_gain(board, state, side):
+    """Small bonus only when doubling speed wins an active speed matchup."""
+    if "tailwind" in state["conditions"][side] or "trickroom" in state["fields"]:
+        return 0.0
+    ours = [m for m in board[side*2:side*2+2] if m and m.hp > 0]
+    foes = [m for m in board[(1-side)*2:(1-side)*2+2] if m and m.hp > 0]
+    flips = sum(_stat(a, "spe", state) <= _stat(b, "spe", state)
+                < 2 * _stat(a, "spe", state) for a in ours for b in foes)
+    return .12 * flips / max(1, len(ours) * len(foes))
+
+
+def _policy_candidates(legal, board, state):
+    """Prefer safe legal actions; never manufacture an action outside the template."""
+    def sensible(joint):
+        used_buffs = set()
+        for slot in range(2):
+            action, mon = joint.get(f"slot_{slot}", {}), board[slot]
+            if not mon or action.get("type") != "move":
+                continue
+            move = _action_move(mon, action)
+            ident = move["id"]
+            # No deliberate friendly fire or ally status tricks in this policy.
+            # Spread damage remains in the simulator; healing/support stays legal.
+            if action.get("target", 0) < 0 and move["target"] in {
+                    "normal", "any", "adjacentfoe", "adjacentally", "adjacentallyorself"}:
+                positive_boost = (move["category"] == "status" and move.get("boosts")
+                                  and all(v >= 0 for v in move["boosts"].values()))
+                if ident not in ALLY_SUPPORT and not positive_boost:
+                    return False
+            if ident in TEAM_BUFFS:
+                if ident in state["conditions"][0] or ident in used_buffs:
+                    return False
+                used_buffs.add(ident)
+        return True
+    filtered = [joint for joint in legal if sensible(joint)]
+    return filtered or legal
+
+
 def _simulate(board0, reserves0, field0, actions0, actions1, tie=0, details=False):
     board = [_copy_mon(m) for m in board0]
     reserves = [dict(side) for side in reserves0]
@@ -632,11 +672,14 @@ def _simulate(board0, reserves0, field0, actions0, actions1, tie=0, details=Fals
                 if target != i and not _blocked(mon, board[target], move, state, board):
                     help_boost.add(target)
             continue
-        if ident in {"tailwind", "reflect", "lightscreen", "auroraveil", "safeguard"}:
+        if ident in TEAM_BUFFS:
             if ident not in state["conditions"][mon.side] and (ident != "auroraveil" or state["weather"] == "snow"):
+                wind_gain = _tailwind_gain(board, state, mon.side)
                 state["conditions"][mon.side].add(ident)
                 alive = sum(bool(m and m.hp > 0) for m in board if m is None or m.side == mon.side)
-                changes[i] += (.10 if ident == "tailwind" else .12 if ident != "safeguard" else .08) * min(1, alive / 2) * reliability
+                changes[i] += ((wind_gain if wind_gain else -.06) if ident == "tailwind" else (.12 if ident != "safeguard" else .08) * min(1, alive / 2)) * reliability
+            else:
+                utility[mon.side] -= .08
             continue
         if ident == "trickroom":
             ours = [_stat(m, "spe", state) for m in board if m and m.hp > 0 and m.side == mon.side]
@@ -941,9 +984,16 @@ def _quick(board, reserves, state, joint, side):
         if action["type"] == "switch":
             incoming = reserves[side].get(norm(action.get("species", "")))
             if incoming:
-                threats = [_damage(foe, incoming, move, state, board) for foe in board[(1-side)*2:(1-side)*2+2] if foe for move in foe.moves if move["category"] != "status"]
-                offense = [_damage(incoming, foe, move, state, board) for foe in board[(1-side)*2:(1-side)*2+2] if foe for move in incoming.moves if move["category"] != "status"]
-                total += max(offense, default=0) * .15 - max(threats, default=0) * .25 + (0 if not mon or mon.hp <= 0 else -.08)
+                switched_board = list(board)
+                switched_board[i] = incoming
+                foes = [foe for foe in board[(1-side)*2:(1-side)*2+2] if foe and foe.hp > 0]
+                # Both foes can attack the incoming slot. Use actual move types,
+                # immunities and remaining HP, rather than species types alone.
+                threats = sum(max((_damage(foe, incoming, move, state, switched_board)
+                                   for move in foe.moves if move["category"] != "status" and _usable(foe, move)), default=0)
+                              for foe in foes)
+                offense = [_damage(incoming, foe, move, state, switched_board) for foe in foes for move in incoming.moves if move["category"] != "status"]
+                total += max(offense, default=0) * .15 - min(2, threats / max(.05, incoming.hp)) * .25 + (0 if not mon or mon.hp <= 0 else -.08)
             continue
         if not mon or mon.hp <= 0 or action["type"] != "move":
             continue
@@ -954,7 +1004,9 @@ def _quick(board, reserves, state, joint, side):
         ident = move["id"]
         if ident in PROTECT:
             total += .02 - .1 * mon.protect_streak
-        elif ident in {"tailwind", "trickroom", "followme", "ragepowder", "helpinghand", "wideguard"}:
+        elif ident == "tailwind":
+            total += _tailwind_gain(board, state, side) - .06
+        elif ident in {"trickroom", "followme", "ragepowder", "helpinghand", "wideguard"}:
             total += .2
         targets = _targets(i, action, move, board, state)
         for target_index in targets:
@@ -1066,6 +1118,7 @@ def choose_battle(observation: dict, template: dict, memory: dict) -> dict:
     if isinstance(forced, bool):
         forced = [forced]
     state["forced_switch"] = any(forced)
+    legal = _policy_candidates(legal, board, state)
     if any(forced):
         responses = [{"slot_0": {"type": "pass"}, "slot_1": {"type": "pass"}}]
     else:
